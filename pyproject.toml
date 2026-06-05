@@ -1,0 +1,13 @@
+[project]
+name = "google-adk-study"
+version = "0.1.0"
+description = "Hello Google ADK"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "google-adk==1.14.1",
+    "google-genai==1.38.0",
+    "litellm==1.77.1",
+    "python-dotenv>=1.1.1",
+
+]

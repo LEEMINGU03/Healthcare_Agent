@@ -1,0 +1,13 @@
+{
+  "recommendations": [
+    "humao.rest-client",
+    "ms-python.black-formatter",
+    "ms-python.python",
+    "esbenp.prettier-vscode",
+    "Anthropic.claude-code",
+    "wayou.vscode-todo-highlight",
+    "google.geminicodeassist",
+    "vscode-icons-team.vscode-icons",
+    "ms-toolsai.jupyter"
+  ]
+}
