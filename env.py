@@ -1,8 +1,8 @@
 import os
-import dotenv
+from diet_agent.config import load_project_dotenv
 
 
-dotenv.load_dotenv()
+load_project_dotenv()
 
 
 def get_env_variable(key: str) -> str:
@@ -14,7 +14,8 @@ def get_env_variable(key: str) -> str:
     return value
 
 
-GEMINI_API_KEY = get_env_variable("GEMINI_API_KEY")
+OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FATSECRET_CLIENT_ID = get_env_variable("FATSECRET_CLIENT_ID")
 FATSECRET_CLIENT_SECRET = get_env_variable("FATSECRET_CLIENT_SECRET")
 MFDS_API_KEY= get_env_variable("MFDS_API_KEY")

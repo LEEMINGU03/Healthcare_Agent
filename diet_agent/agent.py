@@ -1,21 +1,23 @@
 from google.adk.agents import Agent
+from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import ToolContext
 from datetime import datetime
 from google import genai as google_genai
-from dotenv import load_dotenv
+from openai import OpenAI
 import requests
 import os
 import random
 import re
 import time
 from google.genai import types  # 서버 과부하시 자동 재시도
+from diet_agent.config import load_project_dotenv
 
 # ADK가 자체적으로 쓰는 값(GOOGLE_API_KEY 등)과 달리, 우리가 os.getenv()로 직접
 # 읽는 커스텀 환경변수(MFDS_API_KEY, FATSECRET_*, BACKEND_BASE_URL 등)는
 # .env를 명시적으로 로드해야 보입니다. adk web/adk run이 자체적으로 이미
 # 로드했더라도 여기서 다시 불러도 안전합니다 (override=False가 기본이라
 # 기존 값을 덮어쓰지 않음).
-load_dotenv()
+load_project_dotenv()
 
 
 # =======================================================
@@ -29,6 +31,35 @@ retry_config = types.GenerateContentConfig(
     temperature=1.0,
     top_p=0.95,
 )
+
+
+def _get_agent_model():
+    if os.getenv("OPENAI_API_KEY"):
+        return LiteLlm(model=os.getenv("OPENAI_MODEL") or os.getenv("AI_MODEL", "gpt-4o-mini"))
+    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _translate_food_name_to_english(food_name: str) -> str:
+    if os.getenv("OPENAI_API_KEY"):
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL") or os.getenv("AI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}",
+                }
+            ],
+            temperature=0,
+        )
+        return (response.choices[0].message.content or food_name).strip()
+
+    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+    result = client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}",
+    )
+    return result.text.strip() if result.text else food_name
 
 # =========================================================
 # 백엔드 API 공통 설정 (APEXAI Healthcare 백엔드)
@@ -603,12 +634,7 @@ def search_food_nutrition(food_name: str) -> dict:
         # 2. 한글이 포함되어 있으면 영문으로 번역
         search_term = food_name
         if is_korean:
-            client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            result = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}"
-            )
-            search_term = result.text.strip() if result.text else food_name
+            search_term = _translate_food_name_to_english(food_name)
 
         # 2. FatSecret 검색
         token = _get_fatsecret_token()
@@ -963,7 +989,7 @@ def save_chat_message(message: str, tool_context: ToolContext) -> dict:
 
     return _backend_post(
         "/api/chat",
-        {"userId": user_id, "agentType": "DIET", "message": message},
+        {"userId": user_id, "agentType": "DIET", "role": "USER", "message": message},
     )
 
 # =======================================================
@@ -992,7 +1018,7 @@ def get_chat_history(tool_context: ToolContext) -> dict:
 
 root_agent = Agent(
     name="diet_coaching_agent",
-    model="gemini-2.5-flash",
+    model=_get_agent_model(),
     description="사용자의 운동 상태와 생활 패턴을 고려해 식단을 추천하고 관리하는 영양 코칭 에이전트",
     instruction="""
 당신은 사용자의 식사 기록과 운동 상태를 바탕으로 맞춤형 식단을 조언하는 영양 코치입니다.
