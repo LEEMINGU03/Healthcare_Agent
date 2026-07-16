@@ -255,16 +255,39 @@ def _generate_ai_response(request: GenerateRequest) -> GenerateResponse:
     return _generate_with_gemini(request)
 
 
+def _decode_request_body(body: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return body.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return body.decode("latin-1")
+
+
+def _repair_text_encoding(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _repair_text_encoding(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_repair_text_encoding(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        try:
+            return value.encode("latin-1").decode(encoding)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+
+    return value
+
+
 async def _parse_generate_request(raw_request: Request) -> GenerateRequest:
     body = await raw_request.body()
+    text = _decode_request_body(body)
 
     try:
-        text = body.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Request body must be valid UTF-8 JSON.") from exc
-
-    try:
-        payload = json.loads(text)
+        payload = _repair_text_encoding(json.loads(text))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
 
