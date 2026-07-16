@@ -6,11 +6,11 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from google import genai as google_genai
 from google.genai import types
 from openai import OpenAI
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from diet_agent.config import load_project_dotenv
 
@@ -255,11 +255,31 @@ def _generate_ai_response(request: GenerateRequest) -> GenerateResponse:
     return _generate_with_gemini(request)
 
 
+async def _parse_generate_request(raw_request: Request) -> GenerateRequest:
+    body = await raw_request.body()
+
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid UTF-8 JSON.") from exc
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+
+    try:
+        return GenerateRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+
 @app.get("/health")
 def health() -> dict[str, Literal["ok"]]:
     return {"status": "ok"}
 
 
 @app.post("/generate", response_model=GenerateResponse)
-def generate(request: GenerateRequest) -> GenerateResponse:
+async def generate(raw_request: Request) -> GenerateResponse:
+    request = await _parse_generate_request(raw_request)
     return _generate_ai_response(request)
