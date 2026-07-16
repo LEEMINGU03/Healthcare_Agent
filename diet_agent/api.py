@@ -146,9 +146,8 @@ def _result_schema_instruction(chat_type: ChatType, is_greeting: bool) -> str:
     if chat_type == ChatType.COACHING:
         return """
 COACHING 규칙:
-- profile.previousWorkout이 UPPER_BODY이면 최근 상체 운동을 한 것으로 보고, 같은 부위 고강도 반복을 피하세요.
-- profile.previousWorkout이 LOWER_BODY이면 최근 하체 운동을 한 것으로 보고, 같은 부위 고강도 반복을 피하세요.
-- settings.upperBody, settings.lowerBody, settings.durationMinutes가 있으면 사용자의 선택 조건으로 반영하세요.
+- settings.upperBody, settings.lowerBody, durationMinutes 중 하나라도 있으면 사용자가 오늘 부위를 직접 선택한 것입니다. 이 경우 profile.previousWorkout과 상관없이 사용자가 요청한 부위로 루틴을 만드세요. 강도만 previousWorkout을 참고해 조절하세요.
+- settings에 부위 선택이 전혀 없을 때만 profile.previousWorkout을 보고 같은 부위 고강도 반복을 피하세요 (UPPER_BODY였으면 상체, LOWER_BODY였으면 하체 반복 회피).
 - inbody가 있으면 체중, 골격근량, 체지방량, bmrKcal을 강도 조절의 참고 정보로만 사용하세요.
 - history에 최근 운동 관련 대화가 있으면 중복 부위를 피하고, 사용자의 선호를 유지하세요.
 - 통증, 부상, 질환이 언급되면 무리한 동작을 피하게 하고 전문가 상담을 권하세요.
