@@ -154,11 +154,32 @@ def _translate_food_name_to_english(food_name: str) -> str:
     return result.text.strip() if result.text else food_name
 
 
+_NUTRITION_CACHE_TTL_SECONDS = 10 * 60  # "다시 짜줘" 식으로 같은 대화 안에서 메뉴가 겹칠 때 재조회 방지
+_nutrition_cache: dict[str, tuple[float, dict]] = {}
+
+
 def search_food_nutrition(food_name: str) -> dict:
     """음식의 칼로리 및 영양성분을 조회한다.
     한글 음식명은 식약처 식품영양성분DB(한식 위주, 더 정확함)에서 먼저 찾고,
     거기 없으면 영문으로 번역해서 FatSecret으로 조회한다.
+
+    결과는 잠깐(10분) 메모리에 캐싱한다 — 성공/not_found만 캐싱하고, 네트워크
+    오류(error)는 일시적일 수 있어 캐싱하지 않고 매번 다시 시도한다.
     """
+    cache_key = food_name.strip().lower()
+    cached = _nutrition_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_result = cached
+        if time.time() - cached_at < _NUTRITION_CACHE_TTL_SECONDS:
+            return cached_result
+
+    result = _search_food_nutrition_uncached(food_name)
+    if result["status"] in ("success", "not_found"):
+        _nutrition_cache[cache_key] = (time.time(), result)
+    return result
+
+
+def _search_food_nutrition_uncached(food_name: str) -> dict:
     is_korean = any('가' <= c <= '힣' for c in food_name)
 
     if is_korean and MFDS_API_KEY:
