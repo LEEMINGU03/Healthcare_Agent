@@ -163,6 +163,7 @@ COACHING result 스키마:
       {
         "order": 1,
         "name": "운동명",
+        "bodyPart": "THIGH",
         "sets": "3~4세트",
         "reps": "8~12회",
         "description": "자세와 수행 방법",
@@ -173,6 +174,7 @@ COACHING result 스키마:
 }
 운동은 3~5개를 추천하세요. imageUrl을 확실히 모르면 null을 사용하세요.
 sets/reps는 "3~4세트", "8~12회"처럼 백엔드 명세와 같은 문자열로 작성하세요.
+bodyPart는 각 운동이 주로 타깃하는 부위에 맞춰 다음 중 하나를 정확히 사용하세요: BACK, CHEST, BICEPS, TRICEPS, SHOULDER, CORE, GLUTES, THIGH, CALF.
 """.strip()
 
     return """
