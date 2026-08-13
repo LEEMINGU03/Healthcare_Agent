@@ -6,14 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
-from google import genai as google_genai
 
 from diet_agent.config import load_project_dotenv
 
 load_project_dotenv()
 
 # =========================================================
-# 식약처 식품영양성분DB (data.go.kr, 한식 위주 - FatSecret보다 우선 조회)
+# 식약처 식품영양성분DB (data.go.kr, 한식 위주)
 # agent.py의 원래 구현을 그대로 가져오되, ToolContext/ADK 세션 의존성을 제거해서
 # /generate처럼 세션 없는 stateless 호출에서도 그대로 쓸 수 있게 했다.
 # =========================================================
@@ -73,95 +72,12 @@ def _search_mfds_food(food_name: str, num_rows: int = 5) -> dict:
         return {"status": "error", "message": str(e)}
 
 
-# =========================================================
-# FatSecret (MFDS에 없을 때 보조로 사용)
-# =========================================================
-
-FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
-FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
-
-_fatsecret_token_cache: dict[str, Any] = {"token": None, "expires_at": 0}
-
-
-def _get_fatsecret_token() -> str:
-    if _fatsecret_token_cache["token"] and time.time() < _fatsecret_token_cache["expires_at"]:
-        return _fatsecret_token_cache["token"]
-
-    if not FATSECRET_CLIENT_ID or not FATSECRET_CLIENT_SECRET:
-        raise ValueError("FatSecret API 키가 설정되지 않았습니다.")
-
-    response = requests.post(
-        "https://oauth.fatsecret.com/connect/token",
-        auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "client_credentials", "scope": "basic"},
-        timeout=5,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    _fatsecret_token_cache["token"] = data["access_token"]
-    _fatsecret_token_cache["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
-    return data["access_token"]
-
-
-def _parse_fatsecret_description(description: str | None) -> dict:
-    import re
-
-    description = description or ""
-    parsed: dict[str, float] = {}
-
-    patterns = {
-        "calories_kcal": r"Calories:\s*([\d.]+)\s*kcal",
-        "fat_g": r"Fat:\s*([\d.]+)\s*g",
-        "carbs_g": r"Carbs:\s*([\d.]+)\s*g",
-        "protein_g": r"Protein:\s*([\d.]+)\s*g",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, description, re.IGNORECASE)
-        if match:
-            parsed[key] = float(match.group(1))
-
-    serving_match = re.search(r"Per\s+([\d.]+)\s*g", description, re.IGNORECASE)
-    if serving_match:
-        parsed["serving_size_g"] = float(serving_match.group(1))
-
-    return parsed
-
-
-def _translate_food_name_to_english(food_name: str) -> str:
-    if os.getenv("OPENAI_API_KEY"):
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL") or os.getenv("AI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}",
-                }
-            ],
-            temperature=0,
-        )
-        return (response.choices[0].message.content or food_name).strip()
-
-    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
-    result = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        contents=f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}",
-    )
-    return result.text.strip() if result.text else food_name
-
-
 _NUTRITION_CACHE_TTL_SECONDS = 10 * 60  # "다시 짜줘" 식으로 같은 대화 안에서 메뉴가 겹칠 때 재조회 방지
 _nutrition_cache: dict[str, tuple[float, dict]] = {}
 
 
 def search_food_nutrition(food_name: str) -> dict:
-    """음식의 칼로리 및 영양성분을 조회한다.
-    한글 음식명은 식약처 식품영양성분DB(한식 위주, 더 정확함)에서 먼저 찾고,
-    거기 없으면 영문으로 번역해서 FatSecret으로 조회한다.
+    """음식의 칼로리 및 영양성분을 식약처 식품영양성분DB(한식 위주)에서 조회한다.
 
     결과는 잠깐(10분) 메모리에 캐싱한다 — 성공/not_found만 캐싱하고, 네트워크
     오류(error)는 일시적일 수 있어 캐싱하지 않고 매번 다시 시도한다.
@@ -173,69 +89,10 @@ def search_food_nutrition(food_name: str) -> dict:
         if time.time() - cached_at < _NUTRITION_CACHE_TTL_SECONDS:
             return cached_result
 
-    result = _search_food_nutrition_uncached(food_name)
+    result = _search_mfds_food(food_name)
     if result["status"] in ("success", "not_found"):
         _nutrition_cache[cache_key] = (time.time(), result)
     return result
-
-
-def _search_food_nutrition_uncached(food_name: str) -> dict:
-    is_korean = any('가' <= c <= '힣' for c in food_name)
-
-    if is_korean and MFDS_API_KEY:
-        mfds_result = _search_mfds_food(food_name)
-        if mfds_result["status"] == "success":
-            return mfds_result
-
-    if not FATSECRET_CLIENT_ID or not FATSECRET_CLIENT_SECRET:
-        return {"status": "error", "message": "FatSecret API 키가 설정되지 않았습니다."}
-
-    try:
-        search_term = food_name
-        if is_korean:
-            search_term = _translate_food_name_to_english(food_name)
-
-        token = _get_fatsecret_token()
-        response = requests.post(
-            "https://platform.fatsecret.com/rest/server.api",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={
-                "method": "foods.search",
-                "search_expression": search_term,
-                "format": "json",
-                "max_results": 1,
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        foods = data.get("foods", {}).get("food", [])
-        if not foods:
-            return {
-                "status": "not_found",
-                "searched_as": search_term,
-                "message": f"'{food_name}'({search_term})에 대한 정보를 찾을 수 없습니다.",
-            }
-
-        if isinstance(foods, dict):
-            foods = [foods]
-
-        item = foods[0]
-        parsed_nutrition = _parse_fatsecret_description(item.get("food_description"))
-        return {
-            "status": "success",
-            "food_name": item.get("food_name"),
-            "searched_as": search_term,
-            "food_description": item.get("food_description"),
-            **parsed_nutrition,
-            "source": "FatSecret",
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 
 def search_food_nutrition_batch(food_names: list[str]) -> dict[str, dict]:
@@ -323,13 +180,13 @@ def find_recipes_by_ingredients(
     if not recipes:
         return {"status": "error", "message": "레시피 데이터를 가져오지 못했습니다 (키/네트워크 확인 필요)."}
 
-    exclude_terms = set(exclude_terms or [])
+    exclude_set = set(exclude_terms or [])
 
     scored = []
     excluded_count = 0
     for r in recipes:
         parts_text = r.get("RCP_PARTS_DTLS") or ""
-        if exclude_terms and any(term in parts_text for term in exclude_terms if term):
+        if exclude_set and any(term in parts_text for term in exclude_set if term):
             excluded_count += 1
             continue
         matched = [ing for ing in ingredients if ing and ing in parts_text]
@@ -367,7 +224,7 @@ def find_recipes_by_ingredients(
         )
 
     response: dict[str, Any] = {"status": "success", "results": results}
-    if exclude_terms:
-        response["filtered_allergens_or_disliked"] = sorted(exclude_terms)
+    if exclude_set:
+        response["filtered_allergens_or_disliked"] = sorted(exclude_set)
         response["excluded_recipe_count"] = excluded_count
     return response

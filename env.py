@@ -15,7 +15,5 @@ def get_env_variable(key: str) -> str:
 
 
 GEMINI_API_KEY = get_env_variable("GEMINI_API_KEY")
-FATSECRET_CLIENT_ID = get_env_variable("FATSECRET_CLIENT_ID")
-FATSECRET_CLIENT_SECRET = get_env_variable("FATSECRET_CLIENT_SECRET")
 MFDS_API_KEY= get_env_variable("MFDS_API_KEY")
 FOODSAFETYKOREA_API_KEY= get_env_variable("FOODSAFETYKOREA_API_KEY")

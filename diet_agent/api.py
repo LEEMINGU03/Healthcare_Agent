@@ -4,7 +4,7 @@ import json
 import os
 import re
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from google import genai as google_genai
@@ -190,9 +190,14 @@ NUTRITION 규칙:
 - 사용자가 "집에 있는 재료로 뭐 해먹을지" 물으면 find_recipes_by_ingredients 도구로 실제 레시피를
   찾아서 추천하세요.
 - 식단표(result.mealPlan)를 만들기 전에 반드시 history와 이번 message를 먼저 읽고, 오늘 이미
-  언급된(먹었다고 했거나 이미 추천해서 확정한) 끼니가 있는지 확인하세요.
-  - 오늘 날짜에 해당하는 day(가장 첫 번째 day를 "오늘"로 취급)에서, 이미 언급된 슬롯(아침/점심/저녁)은
-    그 실제로 언급된 메뉴 그대로 채우고, 새로 추천하는 것처럼 다른 메뉴로 바꾸지 마세요.
+  언급된 끼니가 있는지 확인하세요. 이때 두 종류를 구분하세요:
+  - **실제로 먹었다고 한 것** (과거형: "먹었어", "먹었다" 등): 이미 벌어진 사실이므로 절대 못 바꿉니다.
+    어떤 새 방향/선호가 나중에 나와도 이 메뉴는 그대로 유지하세요.
+  - **AI가 추천만 했을 뿐 실제로 먹었다는 확인은 없는 것** ("~로 구성했습니다" 같은 이전 AI 응답):
+    아직 확정된 게 아니므로, 사용자가 나중에 새로운 방향/선호를 말하면 이 부분도 그 방향에 맞게
+    바뀔 수 있습니다.
+  - 오늘 날짜에 해당하는 day(가장 첫 번째 day를 "오늘"로 취급)에서, "실제로 먹었다고 한" 슬롯은
+    그 메뉴 그대로 채우고 다른 걸로 바꾸지 마세요. 그 외 슬롯(아직 안 먹은 것)은 자유롭게 채우세요.
   - history에 최근(오늘 포함 최근 며칠) 등장한 메뉴명이 있으면, 남은 끼니를 짤 때 그 메뉴와 겹치지
     않게 구성하세요 (매번 닭가슴살+현미밥만 반복하지 말 것).
   - 단, 이건 이번 대화(history)에 실제로 남아있는 내용까지만입니다. 세션이 새로 시작되어 history가
@@ -202,6 +207,8 @@ NUTRITION 규칙:
   다시 만드는 식단표)에 반드시 반영하세요.
   - 이건 이전 식단표를 그대로 두고 일부만 콕 집어 고치는 게 아니라, 그 방향에 맞게 전체를 다시
     구성하는 겁니다 (예: "가볍게 해줘" -> 전반적으로 칼로리/지방이 낮은 메뉴로 다시 짜기).
+  - **단, 위에서 "실제로 먹었다고 한" 끼니는 이 새 방향으로도 절대 바꾸지 마세요** — 이미 먹은 건
+    되돌릴 수 없으니 그대로 두고, 그 외 나머지(아직 안 먹은 끼니 전부)만 새 방향에 맞게 다시 짜세요.
   - history를 보고 이전에 이미 말한 방향/선호가 있으면(예: 두 턴 전에 "매운 거 빼줘"라고 했음),
     이번 요청에서 다시 언급하지 않았어도 계속 유지해서 반영하세요 — 한 번 말한 선호는 대화가
     끝날 때까지 계속 적용된다고 가정하세요.
@@ -254,7 +261,7 @@ _NUTRITION_TOOL_SPECS: list[dict[str, Any]] = [
         "name": "search_food_nutrition",
         "description": (
             "음식명 목록으로 칼로리 및 영양성분(탄수화물/단백질/지방/나트륨)을 한 번에 조회한다. "
-            "한글 음식명은 식약처 식품영양성분DB를 우선 조회하고 없으면 FatSecret으로 조회한다. "
+            "식약처 식품영양성분DB(한식 위주)에서 조회한다. "
             "여러 메뉴가 필요하면(예: 7일 식단표) 한 번의 호출에 모두 담아서 보내라 — 메뉴 하나마다 "
             "따로 호출하지 마라. 식단표에 넣을 메뉴의 칼로리/영양성분은 반드시 이 도구로 조회한 값을 사용해야 한다."
         ),
@@ -292,32 +299,54 @@ _MAX_TOOL_ITERATIONS = 8
 
 
 def _dispatch_nutrition_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    if name == "search_food_nutrition":
-        return search_food_nutrition_batch(args.get("food_names") or [])
-    if name == "find_recipes_by_ingredients":
-        return find_recipes_by_ingredients(
-            ingredients=args.get("ingredients") or [],
-            max_results=int(args.get("max_results") or 3),
-        )
-    return {"status": "error", "message": f"알 수 없는 도구: {name}"}
+    """모델이 보낸 도구 인자가 스키마와 다르게 와도(잘못된 타입 등) 예외가 그대로
+    새어나가 요청 전체가 500으로 죽는 일이 없도록, 여기서 한 번 더 방어한다."""
+    try:
+        if name == "search_food_nutrition":
+            food_names = args.get("food_names") or []
+            if not isinstance(food_names, list):
+                return {"status": "error", "message": "food_names는 배열이어야 합니다."}
+            food_names = [n for n in food_names if isinstance(n, str)]
+            return search_food_nutrition_batch(food_names)
+        if name == "find_recipes_by_ingredients":
+            ingredients = args.get("ingredients") or []
+            if not isinstance(ingredients, list):
+                return {"status": "error", "message": "ingredients는 배열이어야 합니다."}
+            ingredients = [i for i in ingredients if isinstance(i, str)]
+            return find_recipes_by_ingredients(
+                ingredients=ingredients,
+                max_results=int(args.get("max_results") or 3),
+            )
+        return {"status": "error", "message": f"알 수 없는 도구: {name}"}
+    except Exception as e:
+        return {"status": "error", "message": f"도구 실행 중 오류: {e}"}
+
+
+def _wants_nutrition_tools(request: GenerateRequest) -> bool:
+    # 인사말 요청(message=None)은 조회할 음식이 없으니 도구를 붙이지 않는다 —
+    # 그래야 Gemini 경로에서 JSON 강제 모드를 계속 쓸 수 있다 (도구가 있으면 강제 모드를 못 씀).
+    return request.type == ChatType.NUTRITION and request.message is not None
 
 
 def _generate_with_openai(request: GenerateRequest) -> GenerateResponse:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = os.getenv("OPENAI_MODEL") or os.getenv("AI_MODEL", "gpt-4o-mini")
-    tools = None
-    if request.type == ChatType.NUTRITION:
+    tools: list[dict[str, Any]] | None = None
+    if _wants_nutrition_tools(request):
         tools = [{"type": "function", "function": spec} for spec in _NUTRITION_TOOL_SPECS]
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": _build_prompt(request)}]
 
     for _ in range(_MAX_TOOL_ITERATIONS):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            temperature=0.7,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=cast(Any, messages),
+                tools=cast(Any, tools),
+                temperature=0.7,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"AI 서버(OpenAI) 호출에 실패했습니다: {e}") from e
         message = response.choices[0].message
         if not message.tool_calls:
             return _parse_generate_response(message.content or "")
@@ -330,6 +359,8 @@ def _generate_with_openai(request: GenerateRequest) -> GenerateResponse:
             }
         )
         for tool_call in message.tool_calls:
+            if tool_call.type != "function":
+                continue
             args = json.loads(tool_call.function.arguments or "{}")
             result = _dispatch_nutrition_tool(tool_call.function.name, args)
             messages.append(
@@ -347,30 +378,57 @@ def _generate_with_gemini(request: GenerateRequest) -> GenerateResponse:
     client = google_genai.Client(api_key=_get_gemini_api_key())
     model = os.getenv("AI_MODEL", "gemini-2.5-flash")
 
-    config_kwargs: dict[str, Any] = {"temperature": 0.7, "top_p": 0.9}
-    if request.type == ChatType.NUTRITION:
+    base_config_kwargs: dict[str, Any] = {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        # Gemini가 일시적으로 과부하(503 UNAVAILABLE)일 때 바로 502를 띄우지 않고
+        # SDK 레벨에서 자동 재시도한다 (agent.py의 retry_config와 동일한 설정).
+        "http_options": types.HttpOptions(
+            retry_options=types.HttpRetryOptions(initial_delay=2, attempts=4)
+        ),
+        # thinking_budget 기본값(automatic)은 응답당 최대 5000토큰 넘게 내부 추론에
+        # 써서(측정: 7일 식단표 생성에 33초 이상) 응답이 크게 느려진다. 1024로
+        # 제한하면 같은 요청이 약 14초로 줄면서도(측정치) BMR/TDEE 같은 계산에
+        # 쓸 추론 여유는 어느 정도 남긴다 (0으로 완전히 끄면 더 빠르지만 복잡한
+        # 계산에서 오류 위험이 커짐).
+        "thinking_config": types.ThinkingConfig(thinking_budget=1024),
+    }
+
+    wants_tools = _wants_nutrition_tools(request)
+    tools = None
+    if wants_tools:
         function_declarations = [
             types.FunctionDeclaration(
                 name=spec["name"], description=spec["description"], parameters=spec["parameters"]
             )
             for spec in _NUTRITION_TOOL_SPECS
         ]
-        config_kwargs["tools"] = [types.Tool(function_declarations=function_declarations)]
-    else:
-        # 도구가 없을 때만 JSON 강제 모드 사용 — 도구 호출 턴에서는 모델이 함수 호출을
-        # 내야 하므로 응답을 JSON으로 강제하면 안 된다.
-        config_kwargs["response_mime_type"] = "application/json"
+        tools = [types.Tool(function_declarations=function_declarations)]
 
     contents: list[types.Content] = [
         types.Content(role="user", parts=[types.Part(text=_build_prompt(request))])
     ]
 
+    # 도구 호출 라운드가 이미 한 번 끝났으면(tools_exhausted) 더 이상 도구를 주지 않는다.
+    # Gemini는 tools와 response_mime_type(JSON 강제)을 동시에 못 쓰므로, 영양 조회가
+    # 끝난 다음 턴부터는 tools를 빼고 JSON 강제 모드로 전환해서 마지막 대용량 응답
+    # (7일 식단표 등)을 자유 텍스트가 아닌 구조화 디코딩으로 더 빠르고 안정적으로 받는다.
+    tools_exhausted = False
     for _ in range(_MAX_TOOL_ITERATIONS):
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(**config_kwargs),
-        )
+        config_kwargs = dict(base_config_kwargs)
+        if tools is not None and not tools_exhausted:
+            config_kwargs["tools"] = tools
+        else:
+            config_kwargs["response_mime_type"] = "application/json"
+
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"AI 서버(Gemini) 호출에 실패했습니다: {e}") from e
         if not response.candidates:
             raise HTTPException(status_code=502, detail="AI 응답에 candidate가 없습니다 (안전 필터 등으로 차단됐을 수 있음).")
         candidate = response.candidates[0]
@@ -383,10 +441,11 @@ def _generate_with_gemini(request: GenerateRequest) -> GenerateResponse:
         if not function_calls:
             return _parse_generate_response(response.text or "")
 
+        tools_exhausted = True
         contents.append(candidate.content)
         response_parts = [
             types.Part.from_function_response(
-                name=fc.name, response={"result": _dispatch_nutrition_tool(fc.name, dict(fc.args or {}))}
+                name=fc.name or "", response={"result": _dispatch_nutrition_tool(fc.name or "", dict(fc.args or {}))}
             )
             for fc in function_calls
         ]

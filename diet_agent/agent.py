@@ -1,17 +1,15 @@
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
 from datetime import datetime
-from google import genai as google_genai
 from dotenv import load_dotenv
 import requests
 import os
 import random
-import re
 import time
 from google.genai import types  # 서버 과부하시 자동 재시도
 
 # ADK가 자체적으로 쓰는 값(GOOGLE_API_KEY 등)과 달리, 우리가 os.getenv()로 직접
-# 읽는 커스텀 환경변수(MFDS_API_KEY, FATSECRET_*, BACKEND_BASE_URL 등)는
+# 읽는 커스텀 환경변수(MFDS_API_KEY, BACKEND_BASE_URL 등)는
 # .env를 명시적으로 로드해야 보입니다. adk web/adk run이 자체적으로 이미
 # 로드했더라도 여기서 다시 불러도 안전합니다 (override=False가 기본이라
 # 기존 값을 덮어쓰지 않음).
@@ -274,7 +272,7 @@ def get_user_preferences(tool_context: ToolContext) -> dict:
 
 
 # =========================================================
-# 식약처 식품영양성분DB (공공데이터, 한식 위주 - FatSecret보다 우선 조회)
+# 식약처 식품영양성분DB (공공데이터, 한식 위주)
 # ---------------------------------------------------------
 # data.go.kr 표준 REST API입니다 (구 openapi.foodsafetykorea.go.kr/I2790 방식은
 # 폐기됨 - sample키로 테스트해도 ERROR-310 남, 2026-07 확인).
@@ -513,145 +511,23 @@ def find_recipes_by_ingredients(ingredients: list[str], tool_context: ToolContex
     return response
 
 
-# =========================================================
-# 음식 칼로리 API (fatsecret) - MFDS DB에 없을 때 보조로 사용
-# =========================================================
-
-FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
-FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
-
-_fatsecret_token_cache = {"token": None, "expires_at": 0}
-
-
-def _get_fatsecret_token() -> str:
-    """OAuth 2.0 액세스 토큰을 발급받거나 캐시된 토큰을 반환합니다."""
-    if _fatsecret_token_cache["token"] and time.time() < _fatsecret_token_cache["expires_at"]:
-        return _fatsecret_token_cache["token"]
-
-    if not FATSECRET_CLIENT_ID or not FATSECRET_CLIENT_SECRET:
-        raise ValueError("FatSecret API 키가 설정되지 않았습니다.")
-
-    response = requests.post(
-        "https://oauth.fatsecret.com/connect/token",
-        auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "client_credentials", "scope": "basic"},
-        timeout=5,
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    _fatsecret_token_cache["token"] = data["access_token"]
-    _fatsecret_token_cache["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
-    return data["access_token"]
-
-
-def _parse_fatsecret_description(description: str | None) -> dict:
-    """FatSecret의 food_description은 거의 고정된 포맷입니다:
-    'Per 100g - Calories: 250kcal | Fat: 10.00g | Carbs: 30.00g | Protein: 12.00g'
-    이걸 LLM이 텍스트로 읽고 파싱하게 두지 않고, 정규식으로 직접 뽑아서
-    MFDS 결과와 같은 구조(calories_kcal/protein_g/fat_g/carbs_g)로 맞춰줍니다.
-    실패해도 빈 dict를 반환하니 호출부에서 .get()으로 안전하게 다룰 수 있습니다."""
-    description = description or ""
-    parsed = {}
-
-    patterns = {
-        "calories_kcal": r"Calories:\s*([\d.]+)\s*kcal",
-        "fat_g": r"Fat:\s*([\d.]+)\s*g",
-        "carbs_g": r"Carbs:\s*([\d.]+)\s*g",
-        "protein_g": r"Protein:\s*([\d.]+)\s*g",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, description, re.IGNORECASE)
-        if match:
-            parsed[key] = float(match.group(1))
-
-    serving_match = re.search(r"Per\s+([\d.]+)\s*g", description, re.IGNORECASE)
-    if serving_match:
-        parsed["serving_size_g"] = float(serving_match.group(1))
-
-    return parsed
-
 # =======================================================
 # 통합 음식 검색
 # =======================================================
 
 def search_food_nutrition(food_name: str) -> dict:
-    """음식의 칼로리 및 영양성분을 조회합니다.
-    한글 음식명은 먼저 식약처 식품영양성분DB(한식 위주, 더 정확함)에서 찾아보고,
-    거기 없으면 영문으로 번역해서 FatSecret으로 조회합니다.
+    """음식의 칼로리 및 영양성분을 식약처 식품영양성분DB(한식 위주)에서 조회합니다.
 
     Args:
-        food_name: 조회할 음식명 (한글 또는 영어)
+        food_name: 조회할 음식명
 
     Returns:
         칼로리, 탄수화물, 단백질, 지방 등의 영양성분 정보
     """
-    is_korean = any('가' <= c <= '힣' for c in food_name)
+    if not MFDS_API_KEY:
+        return {"status": "error", "message": "MFDS_API_KEY가 설정되지 않았습니다."}
 
-    # 1. 한글 음식명이면 식약처 DB를 먼저 조회 (한식 정확도가 FatSecret보다 높음)
-    if is_korean and MFDS_API_KEY:
-        mfds_result = _search_mfds_food(food_name)
-        if mfds_result["status"] == "success":
-            return mfds_result
-        # not_found/error면 아래 FatSecret 경로로 계속 진행
-
-    if not FATSECRET_CLIENT_ID or not FATSECRET_CLIENT_SECRET:
-        return {"status": "error", "message": "FatSecret API 키가 설정되지 않았습니다."}
-
-    try:
-        # 2. 한글이 포함되어 있으면 영문으로 번역
-        search_term = food_name
-        if is_korean:
-            client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            result = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"다음 한국 음식명을 영어로 번역해줘. 음식명만 짧게 답해: {food_name}"
-            )
-            search_term = result.text.strip() if result.text else food_name
-
-        # 2. FatSecret 검색
-        token = _get_fatsecret_token()
-        response = requests.post(
-            "https://platform.fatsecret.com/rest/server.api",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={
-                "method": "foods.search",
-                "search_expression": search_term,
-                "format": "json",
-                "max_results": 1,
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        foods = data.get("foods", {}).get("food", [])
-        if not foods:
-            return {
-                "status": "not_found",
-                "searched_as": search_term,
-                "message": f"'{food_name}'({search_term})에 대한 정보를 찾을 수 없습니다."
-            }
-
-        if isinstance(foods, dict):
-            foods = [foods]
-
-        item = foods[0]
-        parsed_nutrition = _parse_fatsecret_description(item.get("food_description"))
-        return {
-            "status": "success",
-            "food_name": item.get("food_name"),
-            "searched_as": search_term,
-            "food_description": item.get("food_description"),
-            **parsed_nutrition,
-            "source": "FatSecret",
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return _search_mfds_food(food_name)
 
 # =========================================================
 # 식단/운동 기록 Tool
@@ -689,9 +565,7 @@ def log_meal(
         protein_g: 단백질(g) (모르면 0)
         fat_g: 지방(g) (모르면 0)
         carbs_g: 탄수화물(g) (모르면 0)
-        sodium_mg: 나트륨(mg) (모르면 0. MFDS 조회 결과는 나트륨을 주지만,
-            FatSecret 경로(한식 DB에 없는 음식)는 아직 나트륨을 안 줘서 그 경우는
-            0으로 전달됩니다)
+        sodium_mg: 나트륨(mg) (모르면 0)
         tool_context: ADK가 자동으로 주입하는 컨텍스트 객체
 
     Returns:
@@ -753,9 +627,9 @@ def get_recent_workouts_for_diet(tool_context: ToolContext) -> dict:
 # 코드로도 한 번 더 구현해서, LLM 암산 오차 없이 정확한 숫자를 줍니다).
 #
 # 나트륨: 한국인 영양소 섭취기준(KDRI) 만성질환위험감소섭취량 2,000mg/일을
-# 상한으로 사용합니다. MFDS 조회 결과(AMT_NUM13, 2026-07-14 검증)는 나트륨을
-# 주지만, FatSecret 경로(한식 DB에 없는 음식)는 아직 안 줘서, 그런 음식만 먹은
-# 날은 나트륨이 하나도 안 잡혀 "추적 안 됨"으로 표시될 수 있습니다.
+# 상한으로 사용합니다. MFDS 조회 결과(AMT_NUM13, 2026-07-14 검증)에서 나트륨을
+# 가져옵니다. MFDS DB에 없는 음식만 먹은 날은 나트륨이 하나도 안 잡혀
+# "추적 안 됨"으로 표시될 수 있습니다.
 #
 # 비타민: 아직 지원하지 않습니다 (별도 필드 검증 필요).
 # =========================================================
