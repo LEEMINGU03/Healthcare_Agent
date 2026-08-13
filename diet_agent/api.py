@@ -13,7 +13,17 @@ from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from diet_agent.config import load_project_dotenv
-from diet_agent.nutrition_tools import find_recipes_by_ingredients, search_food_nutrition_batch
+from diet_agent.nutrition_tools import (
+    ACTIVITY_FACTOR_ACTIVE,
+    ACTIVITY_FACTOR_REST,
+    FAT_RATIO,
+    PROTEIN_RATIO_DEFAULT,
+    PROTEIN_RATIO_DIET,
+    SODIUM_DAILY_LIMIT_MG,
+    find_recipes_by_ingredients,
+    get_meal_variety_options,
+    search_food_nutrition_batch,
+)
 
 
 load_project_dotenv()
@@ -108,9 +118,77 @@ def _strip_json_fence(text: str) -> str:
     return stripped
 
 
+def _compute_nutrition_targets(request: GenerateRequest) -> dict[str, Any]:
+    """agent.py의 _compute_daily_targets와 같은 계산(Mifflin-St Jeor 기반 TDEE +
+    목표 보정, 없으면 체중 기반 배수 폴백)을 이 서버의 요청 스키마에 맞춰 다시
+    구현한다. LLM이 TDEE/단백질/지방 목표를 프롬프트 안에서 암산하다 틀리는 걸
+    막기 위해, 서버가 미리 계산한 숫자를 프롬프트에 박아 넣고 그대로 쓰게 한다.
+
+    agent.py와 달리 이 서버의 UserProfile에는 나이(age) 필드가 없어 Mifflin-St
+    Jeor 공식을 직접 쓸 수 없다. 대신 InbodySnapshot.bmrKcal(인바디 기기 실측값)이
+    있으면 그걸 BMR로 쓰고, 없으면 체중 기반 단백질/지방 배수로만 계산한다
+    (agent.py에서 나이 미확인일 때 쓰는 폴백과 동일한 방식). "오늘 이미 섭취한
+    양"은 이 서버가 받는 값이 아니라서(meal-log-proposal.md 참고, 아직 백엔드
+    미구현) 목표치만 계산하고 부족/과다분은 계산하지 않는다.
+    """
+    weight = request.inbody.weightKg if request.inbody else None
+    if weight is None:
+        return {"note": "체중 정보가 없어 목표치를 계산하지 못했습니다. 일반적인 성인 기준(단백질 100~120g)으로 추정치임을 밝히고 안내하세요."}
+
+    bmr = request.inbody.bmrKcal if request.inbody else None
+    has_recent_workout = request.profile.previousWorkout is not None
+    target_gain_kg = request.profile.targetGainKg or 0
+
+    calorie_target: float | None = None
+    protein_target: float
+    fat_target: float
+
+    if bmr:
+        activity_factor = ACTIVITY_FACTOR_ACTIVE if has_recent_workout else ACTIVITY_FACTOR_REST
+        tdee = bmr * activity_factor
+        goal_adjust = 300 if target_gain_kg > 0 else (-400 if target_gain_kg < 0 else 0)
+        calorie_target = tdee + goal_adjust
+
+        protein_ratio = PROTEIN_RATIO_DIET if target_gain_kg < 0 else PROTEIN_RATIO_DEFAULT
+        protein_target = calorie_target * protein_ratio / 4
+        fat_target = calorie_target * FAT_RATIO / 9
+        note = "inbody.bmrKcal(실측 BMR) 기준으로 계산한 목표치이니 그대로 사용하세요."
+    else:
+        multiplier = 1.8 if has_recent_workout else 1.3
+        protein_target = weight * multiplier
+        fat_target = weight * 0.9
+        note = "BMR 실측값이 없어 체중 기반 배수로 추정한 단백질/지방 목표입니다. 총 칼로리는 대략적인 추정치라고 밝히세요."
+
+    return {
+        "calorie_target_kcal": round(calorie_target) if calorie_target else None,
+        "protein_target_g": round(protein_target),
+        "fat_target_g": round(fat_target),
+        "sodium_limit_mg": SODIUM_DAILY_LIMIT_MG,
+        "note": note,
+    }
+
+
 def _build_prompt(request: GenerateRequest) -> str:
     mode = "운동 코칭" if request.type == ChatType.COACHING else "영양 코칭"
     result_schema = _result_schema_instruction(request.type, request.message is None)
+
+    nutrition_context = ""
+    if request.type == ChatType.NUTRITION:
+        targets = _compute_nutrition_targets(request)
+        nutrition_context += f"""
+서버가 미리 계산한 목표치 (참고용 — 값이 있는 항목은 반드시 이 숫자를 그대로
+쓰고, 스스로 다시 계산하지 마세요):
+{json.dumps(targets, ensure_ascii=False)}
+"""
+        if request.message is not None:
+            recent_text = " ".join(h.content for h in request.history if h.content)
+            variety = get_meal_variety_options(recent_text)
+            nutrition_context += f"""
+다양성 후보 (참고용 — 최근 대화에 나온 재료/메뉴는 이미 제외되어 있습니다.
+반드시 이 안에서만 골라야 하는 건 아니지만, 매번 같은 조합(닭가슴살+현미밥
+반복 등)을 피하는 데 활용하세요):
+{json.dumps(variety, ensure_ascii=False)}
+"""
 
     payload = request.model_dump(mode="json")
     return f"""
@@ -134,7 +212,7 @@ settings, history만 근거로 답하세요.
 - 사용자가 루틴/식단표처럼 구조화 결과를 명확히 요청한 경우에만 result를 만들고, 백엔드 명세의 필드명을 정확히 사용하세요.
 
 {result_schema}
-
+{nutrition_context}
 입력 JSON:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
@@ -187,6 +265,12 @@ NUTRITION 규칙:
   일부 항목이 not_found/error여도 다른 이름으로 바꿔서 다시 호출하지 마세요 (호출할 때마다 응답 시간이
   크게 늘어나 타임아웃 위험이 있습니다). not_found/error인 항목은 그 메뉴를 유지한 채 합리적인 대략치를
   쓰고, reply에 "일부 메뉴는 정확한 조회값이 없어 대략치를 사용했다"고 짧게 밝히세요.
+- 하루 칼로리/단백질/지방 목표와 나트륨 상한은 프롬프트 하단의 "서버가 미리 계산한 목표치"를 그대로
+  쓰세요. 이 값들은 인바디 실측 BMR(있으면)이나 체중 기반 공식으로 서버가 미리 계산한 것이라, 직접
+  암산하는 것보다 정확합니다. note 필드에 계산 방식/한계가 적혀 있으면 reply에 자연스럽게 반영하세요
+  (예: BMR 실측값이 없어 추정치라는 점).
+- 메뉴를 새로 구성할 때는 프롬프트 하단의 "다양성 후보"를 우선 참고해서, 최근 대화에 나온 메뉴나
+  같은 단백질원/조리법을 반복하지 마세요. 그 목록 안에서만 골라야 하는 건 아닙니다.
 - 사용자가 "집에 있는 재료로 뭐 해먹을지" 물으면 find_recipes_by_ingredients 도구로 실제 레시피를
   찾아서 추천하세요.
 - 식단표(result.mealPlan)를 만들기 전에 반드시 history와 이번 message를 먼저 읽고, 오늘 이미
@@ -387,11 +471,13 @@ def _generate_with_gemini(request: GenerateRequest) -> GenerateResponse:
             retry_options=types.HttpRetryOptions(initial_delay=2, attempts=4)
         ),
         # thinking_budget 기본값(automatic)은 응답당 최대 5000토큰 넘게 내부 추론에
-        # 써서(측정: 7일 식단표 생성에 33초 이상) 응답이 크게 느려진다. 1024로
-        # 제한하면 같은 요청이 약 14초로 줄면서도(측정치) BMR/TDEE 같은 계산에
-        # 쓸 추론 여유는 어느 정도 남긴다 (0으로 완전히 끄면 더 빠르지만 복잡한
-        # 계산에서 오류 위험이 커짐).
-        "thinking_config": types.ThinkingConfig(thinking_budget=1024),
+        # 써서 응답이 크게 느려진다. BMR/TDEE 같은 계산은 이제 _compute_nutrition_targets
+        # 가 서버 코드로 미리 계산해서 프롬프트에 숫자로 박아주기 때문에(2026-08-13),
+        # 모델이 그 계산을 위해 따로 추론할 필요가 줄었다 — 그래서 256으로도 충분히
+        # 안정적이다. 7일 식단표 생성 기준 3회 반복 측정: 1024=평균 20.2초(13.7~33.2초),
+        # 256=평균 13.3초(9.3~20.4초), 둘 다 3/3 성공. 0으로 완전히 끄면 더 빠를 때도
+        # 있지만(평균 16.9초) 3번 중 2번은 JSON이 깨져 502로 실패해서 쓰지 않는다.
+        "thinking_config": types.ThinkingConfig(thinking_budget=256),
     }
 
     wants_tools = _wants_nutrition_tools(request)

@@ -1,12 +1,24 @@
 from google.adk.agents import Agent
+from google.adk.planners import BuiltInPlanner
 from google.adk.tools import ToolContext
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
 import os
-import random
-import time
 from google.genai import types  # 서버 과부하시 자동 재시도
+
+from diet_agent.nutrition_tools import (
+    ACTIVITY_FACTOR_ACTIVE,
+    ACTIVITY_FACTOR_REST,
+    FAT_RATIO,
+    PROTEIN_RATIO_DEFAULT,
+    PROTEIN_RATIO_DIET,
+    SODIUM_DAILY_LIMIT_MG,
+    find_recipes_by_ingredients as _shared_find_recipes_by_ingredients,
+    get_meal_variety_options as _shared_get_meal_variety_options,
+    search_food_nutrition,
+    search_food_nutrition_batch,
+)
 
 # ADK가 자체적으로 쓰는 값(GOOGLE_API_KEY 등)과 달리, 우리가 os.getenv()로 직접
 # 읽는 커스텀 환경변수(MFDS_API_KEY, BACKEND_BASE_URL 등)는
@@ -27,6 +39,16 @@ retry_config = types.GenerateContentConfig(
     temperature=1.0,
     top_p=0.95,
 )
+
+# api.py의 /generate와 동일하게 thinking_budget을 제한한다 — automatic 기본값은
+# 답변보다 훨씬 많은 내부 추론 토큰을 써서 응답이 크게 느려진다. agent.py도 같은
+# 값을 써야 두 경로의 응답속도/품질을 동일한 조건에서 비교 테스트할 수 있다.
+# api.py에서 7일 식단표 기준 3회 반복 측정한 결과 256이 1024보다 뚜렷이 빠르면서도
+# (평균 13.3초 vs 20.2초) 3/3 성공했고, 0은 더 빠를 때도 있지만 JSON이 깨져
+# 3번 중 2번 실패해서 쓰지 않는다 (2026-08-13, api.py의 _generate_with_gemini 주석
+# 참고). ADK는 thinking_config를 generate_content_config가 아니라 planner로 넣어야
+# 한다.
+thinking_planner = BuiltInPlanner(thinking_config=types.ThinkingConfig(thinking_budget=256))
 
 # =========================================================
 # 백엔드 API 공통 설정 (APEXAI Healthcare 백엔드)
@@ -214,11 +236,13 @@ def set_user_preferences(
     budget_krw: int,
     allergies: list[str],
     disliked_foods: list[str],
+    diet_direction: list[str],
     tool_context: ToolContext,
 ) -> dict:
-    """나이/성별/목표/하루 예산/하루 식사 횟수/알레르기/기피 음식을 세션에 저장합니다.
-    모르거나 해당 없는 값은 숫자는 0, 문자열은 빈 문자열, 리스트는 빈 리스트로
-    전달하세요 — 그러면 기존에 저장돼 있던 값을 그대로 유지합니다 (덮어쓰지 않음).
+    """나이/성별/목표/하루 예산/하루 식사 횟수/알레르기/기피 음식/식단 방향을
+    세션에 저장합니다. 모르거나 해당 없는 값은 숫자는 0, 문자열은 빈 문자열,
+    리스트는 빈 리스트로 전달하세요 — 그러면 기존에 저장돼 있던 값을 그대로
+    유지합니다 (덮어쓰지 않음).
 
     Args:
         age: 나이 (모르면 0)
@@ -228,6 +252,9 @@ def set_user_preferences(
         budget_krw: 하루 식비 예산(원) (모르면 0)
         allergies: 알레르기 식품 목록 (없으면 빈 리스트 [])
         disliked_foods: 싫어하는 음식 목록 (없으면 빈 리스트 [])
+        diet_direction: 사용자가 말로 요청한 식단 방향 (예: ["가볍게", "저탄수",
+            "저염", "단백질 위주"] 등, 없으면 빈 리스트 []). 알레르기처럼 누적
+            저장되며, 대화가 끝날 때까지 계속 적용됩니다.
         tool_context: ADK가 자동으로 주입하는 컨텍스트 객체
 
     Returns:
@@ -250,6 +277,8 @@ def set_user_preferences(
         prefs["allergies"] = sorted(set(prefs.get("allergies", [])) | set(allergies))
     if disliked_foods:
         prefs["disliked_foods"] = sorted(set(prefs.get("disliked_foods", [])) | set(disliked_foods))
+    if diet_direction:
+        prefs["diet_direction"] = sorted(set(prefs.get("diet_direction", [])) | set(diet_direction))
 
     tool_context.state["user_preferences"] = prefs
     return {"status": "success", "preferences": prefs}
@@ -272,172 +301,17 @@ def get_user_preferences(tool_context: ToolContext) -> dict:
 
 
 # =========================================================
-# 식약처 식품영양성분DB (공공데이터, 한식 위주)
+# 영양성분 조회 · 재료 기반 레시피 추천 (식약처 공공데이터)
 # ---------------------------------------------------------
-# data.go.kr 표준 REST API입니다 (구 openapi.foodsafetykorea.go.kr/I2790 방식은
-# 폐기됨 - sample키로 테스트해도 ERROR-310 남, 2026-07 확인).
-# 문서: https://www.data.go.kr/data/15127578/openapi.do (Swagger "상세기능" 탭)
-# Base URL: apis.data.go.kr/1471000/FoodNtrCpntDbInfo02
-# 엔드포인트: GET /getFoodNtrCpntDbInq02
-# 인증: data.go.kr에서 발급받은 "일반인증키(Encoding)" 서비스키를 serviceKey로 전달
-#       (foodsafetykorea.go.kr 자체 인증키와는 다른 키이니 주의)
-# 응답: {"header": {"resultCode": "00"|기타, "resultMsg": ...},
-#        "body": {"items": [ {FOOD_NM_KR, SERVING_SIZE,
-#                              AMT_NUM1(에너지kcal), AMT_NUM2(수분g),
-#                              AMT_NUM3(단백질g), AMT_NUM4(지방g),
-#                              AMT_NUM5(회분g), AMT_NUM6(탄수화물g),
-#                              AMT_NUM7(당류g), AMT_NUM13(나트륨mg), ...} ], totalCount, ...}}
-# AMT_NUM1~7 매핑은 단백질*4+지방*9+탄수화물*4 ≈ 에너지(kcal) 공식으로 역산해서
-# 검증함 (2026-07-13). AMT_NUM13(나트륨)은 "짠맛" 음식(간장양념치킨/소금도넛)
-# 두 건에서 표준 성분표 순서(칼슘/철/인/칼륨 자리인 9~12는 비어있고 13만 채워짐 —
-# 나트륨은 영양성분표시 의무 항목, 나머지는 아님)로 교차검증함 (2026-07-14).
-# 8~12(식이섬유/칼슘/철/인/칼륨), 14번 이후(비타민류 등)는 아직 미검증.
+# 실제 구현(식약처 식품영양성분DB, 조리식품 레시피 DB 호출 및 캐싱)은
+# diet_agent/nutrition_tools.py에 있다 — api.py의 /generate stateless
+# 서버와 정확히 같은 코드를 쓰기 위해서다 (agent.py에 따로 복사해두면
+# FatSecret 제거·캐싱 추가 같은 수정을 두 군데서 반복해야 했다).
+# search_food_nutrition은 시그니처가 완전히 같아서 그대로 가져다 쓰고,
+# find_recipes_by_ingredients만 ADK 세션에 저장된 알레르기/기피 음식
+# (user_preferences)을 자동으로 exclude_terms로 넘겨주는 얇은 래퍼를 둔다.
 # =========================================================
 
-MFDS_API_KEY = os.getenv("MFDS_API_KEY")
-MFDS_ENDPOINT = "https://apis.data.go.kr/1471000/FoodNtrCpntDbInfo02/getFoodNtrCpntDbInq02"
-
-# =======================================================
-# 숫자 변환 (API에서 받은 문자열 실수로 변환)
-def _to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-# =======================================================
-# 식약처 음식 검색
-# =======================================================
-
-def _search_mfds_food(food_name: str, num_rows: int = 5) -> dict:
-    """식약처 식품영양성분DB(FoodNtrCpntDbInfo02)에서 한글 음식명으로 조회.
-    동일 이름으로 여러 건(가공식품/음식 등)이 나올 수 있어, 칼로리(AMT_NUM1)가
-    비어있지 않은 첫 항목을 채택합니다 (가공식품은 값이 비어있는 경우가 많음)."""
-    if not MFDS_API_KEY:
-        return {"status": "error", "message": "MFDS_API_KEY가 설정되지 않았습니다."}
-
-    try:
-        resp = requests.get(
-            MFDS_ENDPOINT,
-            params={
-                "serviceKey": MFDS_API_KEY,
-                "type": "json",
-                "numOfRows": num_rows,
-                "pageNo": 1,
-                "FOOD_NM_KR": food_name,
-            },
-            timeout=5,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        header = data.get("header", {})
-        if header.get("resultCode") != "00":
-            return {"status": "error", "message": header.get("resultMsg")}
-
-        items = (data.get("body") or {}).get("items") or []
-        if not items:
-            return {"status": "not_found"}
-
-        # 칼로리 값이 채워진 첫 항목을 우선 채택 (없으면 그냥 첫 항목)
-        item = next((i for i in items if _to_float(i.get("AMT_NUM1")) is not None), items[0])
-
-        return {
-            "status": "success",
-            "food_name": item.get("FOOD_NM_KR"),
-            "serving_size": item.get("SERVING_SIZE"),
-            "calories_kcal": _to_float(item.get("AMT_NUM1")),
-            "protein_g": _to_float(item.get("AMT_NUM3")),
-            "fat_g": _to_float(item.get("AMT_NUM4")),
-            "carbs_g": _to_float(item.get("AMT_NUM6")),
-            "sugar_g": _to_float(item.get("AMT_NUM7")),
-            "sodium_mg": _to_float(item.get("AMT_NUM13")),
-            "source": "MFDS",
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-# =========================================================
-# 재료 기반 레시피 추천 (식약처 조리식품의 레시피 DB, COOKRCP01)
-# ---------------------------------------------------------
-# 이 데이터셋은 data.go.kr REST가 아니라 예전 방식 게이트웨이
-# (openapi.foodsafetykorea.go.kr) 그대로 씁니다 (data.go.kr에는 "API 유형: LINK"로
-# 표시되고, 실제 스펙은 foodsafetykorea.go.kr 자체 페이지에 있음).
-# 인증도 영양성분DB 때 쓴 data.go.kr 긴 키가 아니라, foodsafetykorea.go.kr
-# 마이페이지에서 발급받은 짧은 키를 씁니다. 이 서비스(조리식품의 레시피 DB)도
-# 마이페이지에서 별도 활용신청/승인이 필요할 수 있습니다.
-#
-# 요청: http://openapi.foodsafetykorea.go.kr/api/{짧은키}/COOKRCP01/json/{시작}/{끝}
-# 응답: {"COOKRCP01": {"RESULT": {...}, "total_count": ..., "row": [
-#   {RCP_NM(메뉴명), RCP_PARTS_DTLS(재료, 통짜 텍스트), RCP_WAY2(조리방법),
-#    RCP_PAT2(요리종류), INFO_WGT(중량), INFO_ENG(열량), INFO_CAR(탄수화물),
-#    INFO_PRO(단백질), INFO_FAT(지방), INFO_NA(나트륨),
-#    MANUAL01~MANUAL20(조리순서 단계별 텍스트), ATT_FILE_NO_MAIN(대표이미지)} ]}}
-#
-# "재료로 검색" 필터가 따로 없어서, 레시피 전체(약 1,700개)를 받아와 캐싱해두고
-# RCP_PARTS_DTLS 텍스트에 사용자가 가진 재료가 몇 개나 겹치는지 직접 점수
-# 매겨서 상위 결과를 추천합니다.
-# =========================================================
-
-FOODSAFETYKOREA_API_KEY = os.getenv("FOODSAFETYKOREA_API_KEY")
-RECIPE_ENDPOINT_BASE = "http://openapi.foodsafetykorea.go.kr/api"
-RECIPE_SERVICE_ID = "COOKRCP01"
-
-_recipe_cache = {"items": None, "fetched_at": 0.0}
-_RECIPE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 레시피는 자주 안 바뀌므로 6시간 캐싱
-
-# =======================================================
-# 레시피 전체 가져오기
-# =======================================================
-
-def _fetch_all_recipes(force_refresh: bool = False) -> list:
-    """조리식품 레시피 DB 전체를 페이지네이션으로 가져와 캐싱합니다."""
-    now = time.time()
-    if (
-        not force_refresh
-        and _recipe_cache["items"] is not None
-        and (now - _recipe_cache["fetched_at"] < _RECIPE_CACHE_TTL_SECONDS)
-    ):
-        return _recipe_cache["items"]
-
-    if not FOODSAFETYKOREA_API_KEY:
-        return []
-
-    all_rows = []
-    page_size = 1000
-    start = 1
-    try:
-        while True:
-            end = start + page_size - 1
-            url = f"{RECIPE_ENDPOINT_BASE}/{FOODSAFETYKOREA_API_KEY}/{RECIPE_SERVICE_ID}/json/{start}/{end}"
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            block = data.get(RECIPE_SERVICE_ID, {})
-            result = block.get("RESULT", {})
-            if result.get("CODE") not in (None, "INFO-000"):
-                break
-
-            rows = block.get("row") or []
-            if not rows:
-                break
-            all_rows.extend(rows)
-
-            total_count = int(block.get("total_count", len(all_rows)) or len(all_rows))
-            if len(all_rows) >= total_count or len(rows) < page_size:
-                break
-            start += page_size
-    except Exception:
-        pass  # 실패해도 아래에서 기존 캐시(있다면)를 그대로 반환
-
-    if all_rows:
-        _recipe_cache["items"] = all_rows
-        _recipe_cache["fetched_at"] = now
-    return _recipe_cache["items"] or []
-
-# =======================================================
-# 재료와 레시피 비교
-# =======================================================
 
 def find_recipes_by_ingredients(ingredients: list[str], tool_context: ToolContext, max_results: int = 3) -> dict:
     """집에 있는 재료 목록으로 만들 수 있는 레시피를 찾아 추천합니다.
@@ -455,79 +329,9 @@ def find_recipes_by_ingredients(ingredients: list[str], tool_context: ToolContex
     Returns:
         매칭된 레시피 목록 (재료 일치 개수가 많은 순 정렬), 칼로리/영양성분/조리순서 포함
     """
-    if not FOODSAFETYKOREA_API_KEY:
-        return {"status": "error", "message": "FOODSAFETYKOREA_API_KEY가 설정되지 않았습니다."}
-
-    recipes = _fetch_all_recipes()
-    if not recipes:
-        return {"status": "error", "message": "레시피 데이터를 가져오지 못했습니다 (키/네트워크 확인 필요)."}
-
     prefs = tool_context.state.get("user_preferences") or {}
-    exclude_terms = set(prefs.get("allergies", [])) | set(prefs.get("disliked_foods", []))
-
-    scored = []
-    excluded_count = 0
-    for r in recipes:
-        parts_text = r.get("RCP_PARTS_DTLS") or ""
-        if exclude_terms and any(term in parts_text for term in exclude_terms if term):
-            excluded_count += 1
-            continue
-        matched = [ing for ing in ingredients if ing and ing in parts_text]
-        if matched:
-            scored.append((len(matched), matched, r))
-
-    if not scored:
-        msg = "가지고 계신 재료로 매칭되는 레시피를 찾지 못했습니다."
-        if excluded_count:
-            msg += f" (알레르기/기피 음식 때문에 {excluded_count}건 제외됨)"
-        return {"status": "not_found", "message": msg}
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    results = []
-    for match_count, matched, r in scored[:max_results]:
-        steps = [r.get(f"MANUAL{i:02d}") for i in range(1, 21) if r.get(f"MANUAL{i:02d}")]
-        results.append({
-            "recipe_name": r.get("RCP_NM"),
-            "matched_ingredients": matched,
-            "matched_count": match_count,
-            "cooking_method": r.get("RCP_WAY2"),
-            "category": r.get("RCP_PAT2"),
-            "serving_weight": r.get("INFO_WGT"),
-            "calories_kcal": _to_float(r.get("INFO_ENG")),
-            "carbs_g": _to_float(r.get("INFO_CAR")),
-            "protein_g": _to_float(r.get("INFO_PRO")),
-            "fat_g": _to_float(r.get("INFO_FAT")),
-            "sodium_mg": _to_float(r.get("INFO_NA")),
-            "ingredients_text": r.get("RCP_PARTS_DTLS"),
-            "steps": steps,
-            "image_url": r.get("ATT_FILE_NO_MAIN"),
-        })
-
-    response = {"status": "success", "results": results}
-    if exclude_terms:
-        response["filtered_allergens_or_disliked"] = sorted(exclude_terms)
-        response["excluded_recipe_count"] = excluded_count
-    return response
-
-
-# =======================================================
-# 통합 음식 검색
-# =======================================================
-
-def search_food_nutrition(food_name: str) -> dict:
-    """음식의 칼로리 및 영양성분을 식약처 식품영양성분DB(한식 위주)에서 조회합니다.
-
-    Args:
-        food_name: 조회할 음식명
-
-    Returns:
-        칼로리, 탄수화물, 단백질, 지방 등의 영양성분 정보
-    """
-    if not MFDS_API_KEY:
-        return {"status": "error", "message": "MFDS_API_KEY가 설정되지 않았습니다."}
-
-    return _search_mfds_food(food_name)
+    exclude_terms = list(set(prefs.get("allergies", [])) | set(prefs.get("disliked_foods", [])))
+    return _shared_find_recipes_by_ingredients(ingredients, max_results, exclude_terms)
 
 # =========================================================
 # 식단/운동 기록 Tool
@@ -634,7 +438,6 @@ def get_recent_workouts_for_diet(tool_context: ToolContext) -> dict:
 # 비타민: 아직 지원하지 않습니다 (별도 필드 검증 필요).
 # =========================================================
 
-SODIUM_DAILY_LIMIT_MG = 2000  # KDRI 나트륨 만성질환위험감소섭취량(성인 기준)
 _REFERENCE_PROTEIN_FOOD = {"name": "닭가슴살", "protein_g_per_100g": 23}  # 부족분 제안용 참고 식품
 
 
@@ -658,15 +461,14 @@ def _compute_daily_targets(profile: dict, prefs: dict, has_recent_workout: bool)
                 bmr = 10 * weight + 6.25 * height - 5 * age + 5
             else:
                 bmr = 10 * weight + 6.25 * height - 5 * age - 161
-            activity_factor = 1.55 if has_recent_workout else 1.2
+            activity_factor = ACTIVITY_FACTOR_ACTIVE if has_recent_workout else ACTIVITY_FACTOR_REST
             tdee = bmr * activity_factor
             goal_adjust = {"다이어트": -400, "린매스업": 250, "벌크업": 450}.get(goal, 0)
             calorie_target = tdee + goal_adjust
 
-            protein_ratio = 0.35 if goal == "다이어트" else 0.30
-            fat_ratio = 0.25
+            protein_ratio = PROTEIN_RATIO_DIET if goal == "다이어트" else PROTEIN_RATIO_DEFAULT
             protein_target = calorie_target * protein_ratio / 4
-            fat_target = calorie_target * fat_ratio / 9
+            fat_target = calorie_target * FAT_RATIO / 9
         else:
             multiplier = 1.8 if has_recent_workout else 1.3
             protein_target = weight * multiplier
@@ -747,32 +549,11 @@ def get_daily_nutrition_summary(tool_context: ToolContext) -> dict:
 # 식단 다양성 Tool
 # ---------------------------------------------------------
 # LLM이 프롬프트 예시("닭가슴살+현미밥+브로콜리")를 매번 그대로 재사용하는 걸
-# 막기 위한 장치. 카테고리별 재료/조리법/스타일 풀에서 매 호출마다 무작위로
-# 일부를 뽑아 제공하고, 최근 기록된 식단(get_recent_meals)에 등장한 재료는
-# 가능한 후보에서 제외합니다. 실제 조합은 에이전트가 이 후보들을 참고해
-# 구성합니다.
+# 막기 위한 장치. 실제 후보 풀/샘플링 로직은 nutrition_tools.py의
+# get_meal_variety_options에 있다 (api.py의 7일 식단표도 같은 문제를 겪어서
+# 공유 모듈로 옮김). 여기서는 세션에 기록된 최근 식사(get_recent_meals)에서
+# recent_text를 만들어 넘겨주는 얇은 래퍼만 둔다.
 # =========================================================
-
-_PROTEIN_POOL = [
-    "닭가슴살", "닭안심", "소고기 홍두깨살", "돼지고기 안심", "돼지고기 뒷다리살",
-    "고등어", "연어", "참치", "오징어", "새우", "두부", "달걀", "그릭요거트", "렌틸콩",
-]
-_CARB_POOL = [
-    "현미밥", "잡곡밥", "고구마", "감자", "통밀빵", "오트밀", "퀴노아", "메밀면",
-    "현미떡", "통밀 또띠아", "단호박",
-]
-_VEG_POOL = [
-    "브로콜리", "시금치나물", "무생채", "샐러드 채소", "가지구이", "버섯볶음",
-    "오이무침", "콩나물무침", "미역줄기볶음", "파프리카",
-]
-_STYLE_POOL = [
-    "구이", "찜", "볶음", "샐러드", "국/찌개", "덮밥", "비빔", "오븐구이", "샤브샤브",
-]
-_CUISINE_POOL = ["한식", "일식", "양식", "동남아식", "지중해식"]
-
-# =======================================================
-# 식단 후보 선택
-# =======================================================
 
 def get_meal_variety_options(tool_context: ToolContext) -> dict:
     """식단을 다양하게 구성하기 위한 재료/조리법 후보를 무작위로 제공합니다.
@@ -784,22 +565,7 @@ def get_meal_variety_options(tool_context: ToolContext) -> dict:
     """
     recent = tool_context.state.get("meal_history", [])
     recent_text = " ".join(m.get("description", "") for m in recent[-6:])
-
-    def _filtered_sample(pool, k):
-        candidates = [item for item in pool if item not in recent_text]
-        if len(candidates) < k:
-            candidates = pool  # 다 겹치면 그냥 전체 풀에서 뽑음
-        return random.sample(candidates, min(k, len(candidates)))
-
-    return {
-        "protein_options": _filtered_sample(_PROTEIN_POOL, 5),
-        "carb_options": _filtered_sample(_CARB_POOL, 4),
-        "veg_options": _filtered_sample(_VEG_POOL, 4),
-        "cooking_style_options": random.sample(_STYLE_POOL, 4),
-        "cuisine_style_options": random.sample(_CUISINE_POOL, 2),
-        "note": "이 목록은 후보일 뿐입니다. 반드시 여기서만 골라야 하는 건 아니며, "
-                "최근 식사와 겹치지 않는 새로운 조합을 만드는 데 참고하세요.",
-    }
+    return _shared_get_meal_variety_options(recent_text)
 
 
 # =========================================================
@@ -899,6 +665,10 @@ root_agent = Agent(
   돌아가며 바꿔서 제안하세요. get_meal_variety_options가 준 후보를 우선 활용하되,
   꼭 그 목록 안에서만 골라야 하는 건 아닙니다.
 - 같은 끼니 유형(예: 점심)이라도 어제와 오늘 메뉴가 겹치지 않도록 하세요.
+- 사용자가 대화 중 식단 방향(가볍게/저탄수/저염/단백질 위주/예산 낮게 등)을
+  말하면 set_user_preferences의 diet_direction으로 저장하고, 이후 이 대화의
+  모든 끼니 추천(오늘 남은 끼니든 7일 식단표든)에 그 방향을 계속 반영하세요 —
+  다시 언급하지 않아도 대화가 끝날 때까지 유지됩니다.
 
 사용자 등록 규칙:
 - get_user_profile이나 다른 도구가 "userId 없음"류의 결과를 반환해도 대화를 막지 말고
@@ -939,8 +709,13 @@ root_agent = Agent(
 - 오늘 남은 식사에 대해 각각 구체적인 메뉴와 목표 섭취량(g 단위)을 제시하세요.
   이미 지나간 식사는 빼고, 남은 식사 개수는 get_user_preferences의 meals_per_day를
   따르세요 (없으면 기본 3끼: 아침/점심/저녁 + 필요시 간식 1~2회).
-- 각 식사마다 다음 형식으로 제시하세요:
-  "점심: 닭가슴살 150g + 현미밥 120g + 브로콜리 100g (약 450kcal, 단백질 38g)"
+- 남은 식사는 마크다운 표로 정리하세요. 컬럼: 끼니 | 메뉴 | 목표 섭취량 | 칼로리 |
+  탄수화물 | 단백질 | 지방. 예:
+
+  | 끼니 | 메뉴 | 목표 섭취량 | 칼로리 | 탄수화물 | 단백질 | 지방 |
+  |---|---|---|---|---|---|---|
+  | 점심 | 닭가슴살 + 현미밥 + 브로콜리 | 150g + 120g + 100g | 450kcal | 45g | 38g | 8g |
+
 - 끝에 하루 전체 목표를 한 줄로 요약하세요 — 총 칼로리, 총 단백질(g)에 더해
   탄수화물/단백질/지방 비율(%)도 함께 제시하세요 (예: "총 1800kcal, 단백질 130g
   (탄수화물 45% · 단백질 30% · 지방 25%)").
@@ -1022,10 +797,63 @@ root_agent = Agent(
 - 이 흐름은 "먹기 전 추천"이므로 log_meal을 자동으로 호출하지 마세요. 사용자가 그
   메뉴를 실제로 먹었다고 이후에 말하면(예: "방금 그거 먹었어") 그때 일반 식사 기록
   흐름(1~7번)을 따라 search_food_nutrition/log_meal로 기록하세요.
+
+주간(7일) 식단표 요청 (별도 흐름):
+- 사용자가 "일주일 식단표 짜줘", "이번주 식단표", "7일치 식단 계획해줘"처럼 여러
+  날에 걸친 식단표를 명확히 요청하면, 위의 식사 기록 작업 순서(1~7번) 대신 이
+  흐름을 따르세요.
+1. get_user_profile과 get_user_preferences를 호출해서 체중/키/체지방률, 나이/
+   성별/목표/예산/하루 식사횟수/알레르기/기피 음식/diet_direction(이전에 말한
+   식단 방향)을 확인하세요. 체중/키가 미확인이면 평소처럼 짧게 물어보되, 답을
+   안 줘도 일반 성인 기준으로 계속 진행하세요.
+2. get_recent_meals로 오늘 날짜(date가 오늘)에 이미 기록된 끼니가 있는지
+   확인하세요. 있는 슬롯은 실제로 먹은 것이니 그대로 유지하고 절대 다른 메뉴로
+   바꾸지 마세요 (표에는 "(이미 드신 식사)"로 표시). 그 외 모든 요일/슬롯은
+   자유롭게 새로 구성하세요.
+3. 이번 요청에서 식단 방향(가볍게/저탄수/저염/단백질 위주/예산 낮게 등)을
+   말했다면 set_user_preferences의 diet_direction으로 저장하세요. 이전에 이미
+   저장된 diet_direction이 있다면 이번에 다시 언급하지 않았어도 계속 적용하고,
+   표 전체(이미 먹은 끼니 제외)를 그 방향에 맞게 구성하세요. 예: "가볍게" →
+   전반적으로 저칼로리·저지방 메뉴, "저탄수" → 탄수화물 비중 낮은 메뉴, "저염" →
+   국/찌개·젓갈·장류 위주 메뉴 지양, "단백질 위주" → 매 끼니 단백질원 비중 확대,
+   "예산 낮게" → 두부/계란/닭가슴살/콩류 등 저렴한 단백질원 위주.
+4. 7일 × meals_per_day(미확인이면 기본 3끼: 아침/점심/저녁) 만큼 메뉴 이름을
+   먼저 다 정하세요. get_meal_variety_options를 여러 번(예: 요일마다 한 번 정도)
+   호출해서 단백질원/탄수화물원/채소/조리법/음식 스타일이 요일마다, 같은 끼니
+   유형(예: 매일 점심)끼리도 겹치지 않게 다양성을 확보하세요.
+5. 메뉴 이름이 모두 정해지면 search_food_nutrition_batch를 대화당 정확히 한
+   번만 호출해서, 중복 제거한 전체 메뉴 이름 목록의 칼로리/영양성분을 한 번에
+   조회하세요. 메뉴마다 따로따로 search_food_nutrition을 부르지 마세요 — 7일치
+   메뉴를 하나씩 조회하면 응답 시간이 크게 늘어납니다. 일부 메뉴가 not_found/
+   error로 나와도 다른 이름으로 바꿔 재조회하지 말고, 그 메뉴명은 유지한 채
+   합리적인 대략치를 쓰고 답변 끝에 "일부 메뉴는 정확한 조회값이 없어 대략치를
+   사용했다"고 짧게 밝히세요.
+6. 알레르기/기피 음식은 어떤 요일에도 절대 포함하지 마세요.
+7. 응답 형식: 월~일 7일 × 끼니를 한 줄씩, 하나의 마크다운 표로 정리하세요.
+   컬럼: 요일 | 끼니 | 메뉴 | 칼로리 | 탄수화물 | 단백질 | 지방. 오늘 요일에서
+   이미 log_meal로 기록된 슬롯은 메뉴 칸 끝에 "(이미 드신 식사)"를 붙이세요.
+   예:
+
+   | 요일 | 끼니 | 메뉴 | 칼로리 | 탄수화물 | 단백질 | 지방 |
+   |---|---|---|---|---|---|---|
+   | 월 | 아침 | 현미밥 + 닭가슴살 + 브로콜리 | 450kcal | 45g | 38g | 8g |
+   | 월 | 점심 | 삼겹살 200g (이미 드신 식사) | 680kcal | 0g | 34g | 60g |
+   | 월 | 저녁 | 두부 스테이크 + 잡곡밥 | 520kcal | 55g | 32g | 14g |
+   | 화 | 아침 | ... | ... | ... | ... | ... |
+
+   표 끝에 하루 평균 칼로리·단백질과 탄수화물/단백질/지방 비율(%)을 요약하고,
+   diet_direction을 반영했다면 어떤 방향을 반영했는지 한 줄로 언급하세요.
+8. 이 흐름에서는 log_meal을 자동으로 호출하지 마세요 (아직 안 먹은 "계획"이지
+   기록이 아닙니다) — 오늘 이미 log_meal로 기록된 슬롯만 2번처럼 그대로 반영하고,
+   나머지는 계획으로만 제시하세요.
+- 사용자가 "다시 짜줘", "이번엔 저탄수로"처럼 표 전체를 다시 요청하면, 최신
+  diet_direction을 반영해 표 전체(이미 먹은 끼니 제외)를 다시 구성하되, 1~8번
+  순서를 다시 따르세요.
 """,
     tools=[log_meal, get_recent_meals, get_recent_workouts_for_diet, search_food_nutrition,
-           set_user_profile, get_user_profile, register_user, save_chat_message, get_chat_history,
-           get_meal_variety_options, find_recipes_by_ingredients,
+           search_food_nutrition_batch, set_user_profile, get_user_profile, register_user,
+           save_chat_message, get_chat_history, get_meal_variety_options, find_recipes_by_ingredients,
            set_user_preferences, get_user_preferences, get_daily_nutrition_summary],
     generate_content_config=retry_config,
+    planner=thinking_planner,
 )

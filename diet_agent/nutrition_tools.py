@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -10,6 +11,21 @@ import requests
 from diet_agent.config import load_project_dotenv
 
 load_project_dotenv()
+
+# =========================================================
+# 영양 목표 계산에 쓰는 공통 상수
+# ---------------------------------------------------------
+# agent.py(_compute_daily_targets)와 api.py(_compute_nutrition_targets)가 같은
+# 활동계수/비율/나트륨 상한을 쓰도록 여기 하나로 모아둔다 — 두 군데서 각자
+# 숫자를 들고 있으면 한쪽만 고쳤을 때 슬쩍 어긋나기 쉽다.
+# =========================================================
+
+SODIUM_DAILY_LIMIT_MG = 2000  # KDRI 나트륨 만성질환위험감소섭취량(성인 기준)
+ACTIVITY_FACTOR_REST = 1.2
+ACTIVITY_FACTOR_ACTIVE = 1.55
+PROTEIN_RATIO_DIET = 0.35
+PROTEIN_RATIO_DEFAULT = 0.30
+FAT_RATIO = 0.25
 
 # =========================================================
 # 식약처 식품영양성분DB (data.go.kr, 한식 위주)
@@ -228,3 +244,54 @@ def find_recipes_by_ingredients(
         response["filtered_allergens_or_disliked"] = sorted(exclude_set)
         response["excluded_recipe_count"] = excluded_count
     return response
+
+
+# =========================================================
+# 식단 다양성 후보
+# ---------------------------------------------------------
+# 원래 agent.py에만 있던 로직이다. LLM이 프롬프트/과거 답변의 예시 메뉴를 매번
+# 그대로 재사용하는 걸 막기 위해, 카테고리별 재료/조리법/스타일 풀에서 무작위로
+# 일부를 뽑아 후보로 제공한다. recent_text에 이미 등장한 항목은 후보에서 뺀다.
+# api.py(stateless)에서도 7일 식단표를 짤 때 같은 문제(매일 닭가슴살+현미밥
+# 반복)가 있어서 agent.py 전용 코드였던 걸 여기로 옮겨 공유한다.
+# =========================================================
+
+_PROTEIN_POOL = [
+    "닭가슴살", "닭안심", "소고기 홍두깨살", "돼지고기 안심", "돼지고기 뒷다리살",
+    "고등어", "연어", "참치", "오징어", "새우", "두부", "달걀", "그릭요거트", "렌틸콩",
+]
+_CARB_POOL = [
+    "현미밥", "잡곡밥", "고구마", "감자", "통밀빵", "오트밀", "퀴노아", "메밀면",
+    "현미떡", "통밀 또띠아", "단호박",
+]
+_VEG_POOL = [
+    "브로콜리", "시금치나물", "무생채", "샐러드 채소", "가지구이", "버섯볶음",
+    "오이무침", "콩나물무침", "미역줄기볶음", "파프리카",
+]
+_STYLE_POOL = [
+    "구이", "찜", "볶음", "샐러드", "국/찌개", "덮밥", "비빔", "오븐구이", "샤브샤브",
+]
+_CUISINE_POOL = ["한식", "일식", "양식", "동남아식", "지중해식"]
+
+
+def get_meal_variety_options(recent_text: str = "") -> dict:
+    """식단을 다양하게 구성하기 위한 재료/조리법 후보를 무작위로 제공한다.
+    recent_text(최근 식사 설명/대화 이력을 이어붙인 문자열)에 이미 등장한 재료는
+    후보에서 제외한다. 호출할 때마다 무작위로 다른 조합이 나온다.
+    """
+
+    def _filtered_sample(pool: list[str], k: int) -> list[str]:
+        candidates = [item for item in pool if item not in recent_text]
+        if len(candidates) < k:
+            candidates = pool  # 다 겹치면 그냥 전체 풀에서 뽑음
+        return random.sample(candidates, min(k, len(candidates)))
+
+    return {
+        "protein_options": _filtered_sample(_PROTEIN_POOL, 5),
+        "carb_options": _filtered_sample(_CARB_POOL, 4),
+        "veg_options": _filtered_sample(_VEG_POOL, 4),
+        "cooking_style_options": random.sample(_STYLE_POOL, 4),
+        "cuisine_style_options": random.sample(_CUISINE_POOL, 2),
+        "note": "이 목록은 후보일 뿐입니다. 반드시 여기서만 골라야 하는 건 아니며, "
+                "최근 식사와 겹치지 않는 새로운 조합을 만드는 데 참고하세요.",
+    }
