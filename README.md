@@ -29,5 +29,23 @@ OPENAI_MODEL=gpt-4o-mini
 `OPENAI_API_KEY`가 없고 `GOOGLE_API_KEY` 또는 `GEMINI_API_KEY`가 있으면 기존 Gemini 경로를
 fallback으로 사용합니다.
 
+## Vercel 배포
+
+`api/index.py`가 `diet_agent.api:app`을 그대로 노출하고, `pyproject.toml`의
+`[tool.vercel] entrypoint = "diet_agent.api:app"` 설정으로 Vercel이 Python 서버리스
+함수로 자동 인식합니다. 별도의 `vercel.json`은 필요 없습니다.
+
+1. GitHub 저장소를 Vercel 프로젝트에 연결 (main 브랜치를 Production으로 지정)
+2. Vercel 프로젝트 설정 > Environment Variables 에 아래 값 등록
+   - `OPENAI_API_KEY` (필수)
+   - `FATSECRET_CLIENT_ID`, `FATSECRET_CLIENT_SECRET` (필수)
+   - `MFDS_API_KEY` (필수, 식약처 식품영양성분DB)
+   - `FOODSAFETYKOREA_API_KEY` (필수, 식약처 레시피DB용 별도 키)
+   - `OPENAI_MODEL` (선택, 기본값 `gpt-4o-mini`)
+   - `GEMINI_API_KEY` 또는 `GOOGLE_API_KEY` (선택, OpenAI 키 없을 때 fallback)
+   - `BACKEND_BASE_URL` (선택, 기본값 `http://localhost:8080` — 배포 시 실제 백엔드 주소로 지정)
+3. main 브랜치에 push하면 Vercel이 자동 빌드/배포
+4. 배포 후 `https://<프로젝트>.vercel.app/health` 로 정상 기동 확인
+
 ## git 규칙
 - main으로 합치기전에 점검을 위해 develop에서 한번더 분기
