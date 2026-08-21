@@ -5,9 +5,15 @@ description = "Hello Google ADK"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.116.1",
     "google-adk==1.14.1",
     "google-genai==1.38.0",
     "litellm==1.77.1",
+    "openai>=1.108.1",
     "python-dotenv>=1.1.1",
+    "uvicorn>=0.35.0",
 
 ]
+
+[tool.vercel]
+entrypoint = "diet_agent.api:app"
